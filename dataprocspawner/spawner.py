@@ -38,7 +38,6 @@ from google.cloud.dataproc_v1beta2.services.cluster_controller.transports import
     ClusterControllerGrpcTransport
 from google.cloud.dataproc_v1beta2.types.shared import Component
 from google.protobuf.json_format import MessageToDict
-from googleapiclient import discovery
 from jupyterhub import orm
 from jupyterhub.spawner import Spawner
 from traitlets import Bool, Dict, List, Unicode
@@ -188,7 +187,7 @@ class DataprocSpawner(Spawner):
       """,)
 
   zone = Unicode(
-    'us-central1-a',
+      'us-central1-a',
       config=True,
       help=""" The zone in which to run the Dataproc cluster.""",)
 
@@ -329,22 +328,6 @@ class DataprocSpawner(Spawner):
     self.component_gateway_url = None
     self.progressor = SimpleNamespace(bar=0, logging=set(), start='')
 
-    metadata_instance = 'http://metadata.google.internal/computeMetadata/v1/instance'
-
-    # Defaults region if not specified to Dataproc Hub's region.
-    if not self.region:
-      try:
-        r = requests.get(
-            f'{metadata_instance}/zone',
-            headers={'Metadata-Flavor': 'Google'})
-        r.raise_for_status()
-        self.region = '-'.join(r.text.split('/')[-1].split('-')[:-1])
-        self.log.info(f'# Using region {self.region}')
-      except Exception as e:  ## pylint: disable=broad-except
-        self.log.info(
-          'Fetching Hub region failed. Probably not running on GCE. '
-          f'Consider setting JUPYTERHUB_REGION as a container env: {e}.')
-
     # Check if we have a notebooks proxy URL
     self.hub_host = ''
     if 'hub_host' in kwargs:
@@ -352,7 +335,7 @@ class DataprocSpawner(Spawner):
     else:
       try:
         r = requests.get(
-            f'{metadata_instance}/attributes/proxy-url',
+            'http://metadata.google.internal/computeMetadata/v1/instance/attributes/proxy-url',
             headers={'Metadata-Flavor': 'Google'})
         r.raise_for_status()
         self.hub_host = f'https://{r.text}/'
@@ -365,7 +348,6 @@ class DataprocSpawner(Spawner):
       self.dataproc_client = kwargs.get('dataproc')
       self.gcs_client = kwargs.get('gcs')
       self.logging_client = kwargs.get('logging')
-      self.compute_client = kwargs.get('compute')
     else:
       self.client_transport = (
           ClusterControllerGrpcTransport(
@@ -375,7 +357,6 @@ class DataprocSpawner(Spawner):
                           f'{self.region}-dataproc.googleapis.com:443'})
       self.gcs_client = storage.Client(project=self.project)
       self.logging_client = logging_v2.LoggingServiceV2Client()
-      self.compute_client = discovery.build('compute', 'v1', cache_discovery=False)
 
     if self.gcs_notebooks:
       if self.gcs_notebooks.startswith('gs://'):
@@ -384,13 +365,9 @@ class DataprocSpawner(Spawner):
       self.gcs_user_folder = f'gs://{self.gcs_notebooks}/{self.get_username()}'
 
     if self.allow_random_cluster_names:
-      self.rand_str = '-' + self._get_rand_string(4)
+      self.rand_str = '-' + self.get_rand_string(4)
     else:
       self.rand_str = ''
-
-    # Defaults zones if not specified or validate given zones if specified.
-    self.dataproc_zones = self._validate_zones(self.region, self.dataproc_locations_list)
-
 
   ##############################################################################
   # Required functions
@@ -593,7 +570,7 @@ class DataprocSpawner(Spawner):
     """
     base_html = get_base_cluster_html_form(
         self._list_gcs_files(self.dataproc_configs),
-        self.dataproc_zones,
+        self.dataproc_locations_list.split(','),
         self.region
     )
 
@@ -1064,43 +1041,17 @@ class DataprocSpawner(Spawner):
     # Unrecognized minor version, fail open
     return True
 
-  def _list_to_dict(self, rlist):
+  def list_to_dict(self, rlist):
     """ Converts list of user defined labels to dictionary. """
     return dict(map(lambda s: s.split(':'), rlist))
 
-  def _get_rand_string(self, length):
+  def get_rand_string(self, length):
     """ Generates a fixed length random alphanumeric string of lower letters
     and digits.
     """
     letters_and_digits = string.ascii_lowercase + string.digits
     rand_str = ''.join((random.choice(letters_and_digits) for i in range(length)))
     return rand_str
-
-  def _validate_zones(self, region, zones):
-    """ Checks that given zone letters are in a given region.
-
-    Args:
-      region (str): a region name similar to us-central1
-      zones (str): a comma-separated list of zones letters.
-    Returns:
-      If zones letters are provided, returns letters that exist in the region.
-      If no zones letters are provided, returns all the letters for the region.
-    """
-    zone_filter = (
-        f'region eq '
-        f'https://www.googleapis.com/compute/v1/projects/{self.project}/'
-        f'regions/{region}')
-    try:
-      request = self.compute_client.zones().list(project=self.project, filter=zone_filter)
-      response = request.execute()
-      region_zone_letters = [z['name'][-1].strip() for z in response['items']]
-    except Exception as e: ## pylint: disable=broad-except
-      self.log.info(f'Failed to validate Dataproc locations list:\n\t{e}')
-
-    if not zones:
-      return region_zone_letters
-
-    return [z for z in zones.split(',') if z in region_zone_letters] or region_zone_letters
 
 
 ################################################################################
@@ -1170,21 +1121,9 @@ class DataprocSpawner(Spawner):
       config.setdefault('worker_config', {})
       config['worker_config']['machine_type_uri'] = self.user_options.get('worker_node_type')
 
-    if self.user_options.get('master_disk_type'):
-      config.setdefault('master_config', {})
-      config['master_config'].setdefault('disk_config', {})
-      config['master_config']['disk_config']['boot_disk_type'] = \
-        self.user_options.get('master_disk_type')
-
-    if self.user_options.get('worker_disk_type'):
-      config.setdefault('worker_config', {})
-      config['worker_config'].setdefault('disk_config', {})
-      config['worker_config']['disk_config']['boot_disk_type'] = \
-        self.user_options.get('worker_disk_type')
-
-    if self.user_options.get('master_disk_size'):
+    if self.user_options.get('master_node_disc_size'):
       try:
-        val = int(self.user_options.get('master_disk_size'))
+        val = int(self.user_options.get('master_node_disc_size'))
         if val < 15:
           val = 15
         config.setdefault('master_config', {})
@@ -1193,9 +1132,9 @@ class DataprocSpawner(Spawner):
       except ValueError:
         pass
 
-    if self.user_options.get('worker_disk_size'):
+    if self.user_options.get('worker_node_disc_size'):
       try:
-        val = int(self.user_options.get('worker_disk_size'))
+        val = int(self.user_options.get('worker_node_disc_size'))
         if val < 15:
           val = 15
         config.setdefault('worker_config', {})
@@ -1238,7 +1177,7 @@ class DataprocSpawner(Spawner):
 
     if self.user_options.get('custom_labels'):
       cluster_data.setdefault('labels', {})
-      for key, val in self._list_to_dict(self.user_options.get('custom_labels').split(',')).items():
+      for key, val in self.list_to_dict(self.user_options.get('custom_labels').split(',')).items():
         cluster_data['labels'][key] = val
 
     return cluster_data
